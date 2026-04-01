@@ -8,10 +8,6 @@ from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
 
-# Set up logging
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-
 # Initialize Glue context
 args = getResolvedOptions(sys.argv, ['JOB_NAME'])
 sc = SparkContext()
@@ -20,7 +16,10 @@ spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
+# Set up logging
+logger = glueContext.get_logger()
 logger.info(f"Job started: {args['JOB_NAME']}")
+print(f"[OUTPUT] Job started: {args['JOB_NAME']}")
 
 # Fetch credentials from Secrets Manager
 try:
@@ -31,12 +30,16 @@ try:
         )['SecretString']
     )
     logger.info("Successfully retrieved credentials from Secrets Manager")
+    print("[OUTPUT] Successfully retrieved credentials from Secrets Manager")
 except Exception as e:
     logger.error(f"Failed to retrieve secret: {str(e)}")
+    print(f"[OUTPUT] ERROR - Failed to retrieve secret: {str(e)}")
     raise
 
 # Build JDBC URL from secret
 jdbc_url = f"jdbc:postgresql://{secret['host']}:{secret['port']}/{secret['dbname']}"
+logger.info(f"JDBC URL built: {jdbc_url}")
+print(f"[OUTPUT] JDBC URL built: {jdbc_url}")
 
 # Read from PostgreSQL with bookmark
 try:
@@ -52,9 +55,12 @@ try:
         },
         transformation_ctx="loans_postgres_node"
     )
-    logger.info(f"Rows read from Postgres: {loans_df.count()}")
+    row_count = loans_df.count()
+    logger.info(f"Rows read from Postgres: {row_count}")
+    print(f"[OUTPUT] Rows read from Postgres: {row_count}")
 except Exception as e:
     logger.error(f"Failed to read from Postgres: {str(e)}")
+    print(f"[OUTPUT] ERROR - Failed to read from Postgres: {str(e)}")
     raise
 
 # Write to S3 as parquet
@@ -69,9 +75,12 @@ try:
         transformation_ctx="loans_s3_node"
     )
     logger.info("Write to S3 completed successfully")
+    print("[OUTPUT] Write to S3 completed successfully")
 except Exception as e:
     logger.error(f"Failed to write to S3: {str(e)}")
+    print(f"[OUTPUT] ERROR - Failed to write to S3: {str(e)}")
     raise
 
 job.commit()
 logger.info(f"Job completed successfully: {args['JOB_NAME']}")
+print(f"[OUTPUT] Job completed successfully: {args['JOB_NAME']}")
