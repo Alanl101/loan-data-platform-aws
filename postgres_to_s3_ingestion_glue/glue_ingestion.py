@@ -47,7 +47,7 @@ try:
             "dbtable": "origination.loans",
             "user": secret['username'],
             "password": secret['password'],
-            "jobBookmarkKeys": ["created_at"],
+            "jobBookmarkKeys": ["updated_at"],
             "jobBookmarkKeysSortOrder": "asc"
         },
         transformation_ctx="loans_postgres_node"
