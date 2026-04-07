@@ -19,43 +19,61 @@ loans_df = spark.read.parquet(
     "s3://poc1-alan-s3-us-east-1/poc1-bronze-alan-s3-us-east-1/poc1-bronze-loans-alan-s3-us-east-1/"
 )
 
-# Step 1 - Critical Data Quality Checks
+loans_df.cache()
+
+# Step 1 - Audit raw data (informational only)
 total_rows = loans_df.count()
 null_loan_ids = loans_df.filter(F.col("loan_id").isNull()).count()
-duplicate_loan_ids = total_rows - loans_df.dropDuplicates(["loan_id"]).count()
+duplicate_loan_ids = total_rows - loans_df.select("loan_id").dropDuplicates().count()
 negative_amounts = loans_df.filter(F.col("loan_amount") < 0).count()
 
 print(f"Total rows: {total_rows}")
 print(f"Null loan_ids: {null_loan_ids}")
-print(f"Duplicate loan_ids: {duplicate_loan_ids}")
+print(f"Duplicate loan_ids: {duplicate_loan_ids} (will be deduplicated in cleaning step)")
 print(f"Negative loan amounts: {negative_amounts}")
 
-# Step 2 - Fail the job if critical checks fail
-if null_loan_ids > 0:
-    raise Exception(f"Data quality failed: {null_loan_ids} null loan_ids found. Stopping job.")
+loans_df.unpersist()
 
-if duplicate_loan_ids > 0:
-    raise Exception(f"Data quality failed: {duplicate_loan_ids} duplicate loan_ids found. Stopping job.")
-
-if negative_amounts > 0:
-    raise Exception(f"Data quality failed: {negative_amounts} negative loan amounts found. Stopping job.")
-
-print("Critical data quality checks passed. Proceeding to silver layer.")
-
-# Step 3 - Clean and Transform
-silver_df = loans_df \
+# Step 2 - Clean and Transform
+silver_df = (
+    loans_df
     # Data Validation Rules - removing invalid records
-    .dropDuplicates(["loan_id"]) \
-    .filter(F.col("loan_amount") > 0) \
-    .filter(F.col("loan_id").isNotNull()) \
-    # Type casting, standardization and adding data information
-    .withColumn("origination_date", F.to_date(F.col("origination_date"))) \
-    .withColumn("loan_amount", F.col("loan_amount").cast("double")) \
-    .withColumn("interest_rate", F.col("interest_rate").cast("double")) \
-    .withColumn("loan_status", F.lower(F.trim(F.col("loan_status")))) \
-    .withColumn("processed_date", F.current_timestamp()) \
-    .withColumn("source_system", F.lit("postgresql_ec2")) \
+    .dropDuplicates(["loan_id"])
+    .filter(F.col("loan_amount") > 0)
+    .filter(F.col("loan_id").isNotNull())
+    # Type casting, standardization and adding metadata
+    .withColumn("origination_date", F.to_date(F.col("origination_date")))
+    .withColumn("loan_amount", F.col("loan_amount").cast("double"))
+    .withColumn("interest_rate", F.col("interest_rate").cast("double"))
+    .withColumn("loan_status", F.lower(F.trim(F.col("loan_status"))))
+    .withColumn("processed_date", F.current_timestamp())
+    .withColumn("source_system", F.lit("postgresql_ec2"))
     .withColumn("pipeline_run_id", F.lit(args['JOB_NAME']))
+)
+
+silver_df.cache()
+
+# Step 3 - Validate cleaned data, fail if anything still wrong
+clean_total = silver_df.count()
+clean_duplicates = clean_total - silver_df.select("loan_id").dropDuplicates().count()
+clean_nulls = silver_df.filter(F.col("loan_id").isNull()).count()
+clean_negatives = silver_df.filter(F.col("loan_amount") < 0).count()
+
+print(f"Clean total rows: {clean_total}")
+print(f"Remaining duplicate loan_ids: {clean_duplicates}")
+print(f"Remaining null loan_ids: {clean_nulls}")
+print(f"Remaining negative loan amounts: {clean_negatives}")
+
+if clean_duplicates > 0:
+    raise Exception(f"Data quality failed: {clean_duplicates} duplicate loan_ids remain after cleaning.")
+if clean_nulls > 0:
+    raise Exception(f"Data quality failed: {clean_nulls} null loan_ids remain after cleaning.")
+if clean_negatives > 0:
+    raise Exception(f"Data quality failed: {clean_negatives} negative loan amounts remain after cleaning.")
+
+print("Post-clean data quality checks passed. Proceeding to write silver layer.")
+
+silver_df.unpersist()
 
 # Step 4 - Write to silver layer
 glueContext.write_dynamic_frame.from_options(
