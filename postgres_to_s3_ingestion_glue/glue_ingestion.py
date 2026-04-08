@@ -1,85 +1,103 @@
 import sys
-import logging
 import boto3
 import json
-from awsglue.transforms import *
-from awsglue.utils import getResolvedOptions
+from datetime import datetime, timedelta
 from pyspark.context import SparkContext
+from pyspark.sql import functions as F
+from awsglue.utils import getResolvedOptions
 from awsglue.context import GlueContext
 from awsglue.job import Job
 
-# Initialize Glue context
+# -- Init 
 args = getResolvedOptions(sys.argv, ['JOB_NAME'])
 sc = SparkContext()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
+logger = glueContext.get_logger()
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
-# Set up logging
-logger = glueContext.get_logger()
 logger.info(f"Job started: {args['JOB_NAME']}")
 print(f"[OUTPUT] Job started: {args['JOB_NAME']}")
 
-# Fetch credentials from Secrets Manager
+# -- Secrets
 try:
-    client = boto3.client('secretsmanager', region_name='us-east-1')
     secret = json.loads(
-        client.get_secret_value(
-            SecretId='poc/postgres/credentials'
-        )['SecretString']
+        boto3.client('secretsmanager', region_name='us-east-1')
+        .get_secret_value(SecretId='poc/postgres/credentials')['SecretString']
     )
-    logger.info("Successfully retrieved credentials from Secrets Manager")
-    print("[OUTPUT] Successfully retrieved credentials from Secrets Manager")
+    logger.info("Secrets retrieved successfully")
+    print("[OUTPUT] Secrets retrieved successfully")
 except Exception as e:
-    logger.error(f"Failed to retrieve secret: {str(e)}")
-    print(f"[OUTPUT] ERROR - Failed to retrieve secret: {str(e)}")
+    logger.error(f"Failed to retrieve secret: {e}")
+    print(f"[OUTPUT] ERROR - Failed to retrieve secret: {e}")
     raise
 
-# Build JDBC URL from secret
 jdbc_url = f"jdbc:postgresql://{secret['host']}:{secret['port']}/{secret['dbname']}"
+jdbc_props = {
+    "user":     secret['username'],
+    "password": secret['password'],
+    "driver":   "org.postgresql.Driver"
+}
+
 logger.info(f"JDBC URL built: {jdbc_url}")
 print(f"[OUTPUT] JDBC URL built: {jdbc_url}")
 
-# Read from PostgreSQL with bookmark
+# -- 3-Day Window 
+now = datetime.utcnow()
+window_start = (now - timedelta(days=2)).strftime('%Y-%m-%d')
+
+logger.info(f"Ingesting records updated since: {window_start}")
+print(f"[OUTPUT] Ingesting records updated since: {window_start}")
+
+# -- Extract
 try:
-    loans_df = glueContext.create_dynamic_frame.from_options(
-        connection_type="postgresql",
-        connection_options={
-            "url": jdbc_url,
-            "dbtable": "origination.loans",
-            "user": secret['username'],
-            "password": secret['password'],
-            "jobBookmarkKeys": ["updated_at"],
-            "jobBookmarkKeysSortOrder": "asc"
-        },
-        transformation_ctx="loans_postgres_node"
+    loans_df = spark.read.jdbc(
+        url=jdbc_url,
+        table=f"""(
+            SELECT * FROM origination.loans
+            WHERE updated_at >= '{window_start}'
+        ) AS loans_window""",
+        properties=jdbc_props
     )
     row_count = loans_df.count()
     logger.info(f"Rows read from Postgres: {row_count}")
     print(f"[OUTPUT] Rows read from Postgres: {row_count}")
 except Exception as e:
-    logger.error(f"Failed to read from Postgres: {str(e)}")
-    print(f"[OUTPUT] ERROR - Failed to read from Postgres: {str(e)}")
+    logger.error(f"Failed to read from Postgres: {e}")
+    print(f"[OUTPUT] ERROR - Failed to read from Postgres: {e}")
     raise
 
-# Write to S3 as parquet
+if row_count == 0:
+    logger.info("No records in window. Exiting.")
+    print("[OUTPUT] No records in window. Exiting.")
+    job.commit()
+    sys.exit(0)
+
+# -- Add Partition Columns 
+loans_df = loans_df \
+    .withColumn("year",  F.lit(now.year)) \
+    .withColumn("month", F.lit(now.month)) \
+    .withColumn("day",   F.lit(now.day))
+
+# -- Write to Bronze 
+spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+
 try:
-    glueContext.write_dynamic_frame.from_options(
-        frame=loans_df,
-        connection_type="s3",
-        format="parquet",
-        connection_options={
-            "path": "s3://poc1-alan-s3-us-east-1/poc1-bronze-alan-s3-us-east-1/poc1-bronze-loans-alan-s3-us-east-1/"
-        },
-        transformation_ctx="loans_s3_node"
-    )
+    loans_df.write \
+        .mode("overwrite") \
+        .partitionBy("year", "month", "day") \
+        .parquet("s3://poc1-alan-s3-us-east-1/poc1-bronze-alan-s3-us-east-1/loans/")
     logger.info("Write to S3 completed successfully")
     print("[OUTPUT] Write to S3 completed successfully")
 except Exception as e:
-    logger.error(f"Failed to write to S3: {str(e)}")
-    print(f"[OUTPUT] ERROR - Failed to write to S3: {str(e)}")
-    raise
+    logger.error(f"Failed to write to S3, routing to dead-letter: {e}")
+    print(f"[OUTPUT] ERROR - Failed to write to S3, routing to dead-letter: {e}")
+    loans_df.write.mode("append").parquet(
+        f"s3://poc1-alan-s3-us-east-1/poc1-bronze-alan-s3-us-east-1/dead-letter/loans/{now.strftime('%Y/%m/%d')}/"
+    )
+    job.commit()
+    sys.exit(1)
 
 job.commit()
 logger.info(f"Job completed successfully: {args['JOB_NAME']}")
